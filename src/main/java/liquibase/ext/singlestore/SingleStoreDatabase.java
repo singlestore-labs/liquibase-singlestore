@@ -1,11 +1,11 @@
 package liquibase.ext.singlestore;
 
-import java.lang.reflect.Field;
+import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.ResourceBundle;
+import liquibase.Scope;
 import liquibase.database.DatabaseConnection;
 import liquibase.database.core.MariaDBDatabase;
 import liquibase.database.jvm.JdbcConnection;
@@ -61,55 +61,42 @@ public class SingleStoreDatabase extends MariaDBDatabase {
     }
 
     @Override
-    public void setConnection(DatabaseConnection conn) {
-        // Modify the URL in the connection before passing to parent
-        modifyConnectionUrl(conn);
-        super.setConnection(conn);
-    }
-
-    private void modifyConnectionUrl(DatabaseConnection conn) {
-        if (!(conn instanceof JdbcConnection)) {
-            return;
-        }
-        String originalUrl = conn.getURL();
-        if (originalUrl == null || !originalUrl.startsWith("jdbc:singlestore")) {
-            return;
-        }
-        String modifiedUrl = addConnectionAttributes(originalUrl);        
-        try {
-            Field urlField = conn.getClass().getDeclaredField("url");
-            urlField.setAccessible(true);
-            urlField.set(conn, modifiedUrl);
-        } catch (NoSuchFieldException | IllegalAccessException e) {
-            // Silently fail if we can't modify the URL
-        }
-    }
-
-    private String addConnectionAttributes(String originalUrl) {
-        String liquibaseVersion = getLiquibaseVersion();
-        String connectionAttributes = "_connector_name:Liquibase,_connector_version:" + liquibaseVersion;
+    public void setConnection(final DatabaseConnection conn) {
+        DatabaseConnection connectionToUse = conn;
         
-        String separator = originalUrl.contains("?") ? "&" : "?";
+        // If a user creates a JDBC connection manually and passes it to Liquibase,
+        // this method will be called. Normally, a connection will be opened by
+        // Liquibase based on the connection URL configured. In that case, the
+        // SingleStoreConnection class will ensure connectionAttributes are set.
+        // However, when a user creates the connection programmatically and passes it to
+        // Liquibase, we need to check if connectionAttributes are missing and create
+        // a replacement connection with them.
+        if (!(conn instanceof SingleStoreConnection)
+            && conn instanceof JdbcConnection) {
+            JdbcConnection jdbcConn = (JdbcConnection) conn;
+            String url = jdbcConn.getURL();
+            
+            // Check if it's a SingleStore connection without connectionAttributes
+            if (url != null && url.startsWith("jdbc:singlestore") && !url.contains("connectionAttributes=")) {
+                // Create a replacement connection with connectionAttributes
+                try {
+                    String modifiedUrl = SingleStoreConnection.addConnectionAttributesToUrl(url);
+                    connectionToUse = new SingleStoreConnection(
+                        DriverManager.getConnection(modifiedUrl),
+                        conn  // Pass original connection so it gets closed when replacement is closed
+                    );
+                    
+                    Scope.getCurrentScope().getLog(getClass()).info(
+                        "Replaced manually-created connection with one that includes SingleStore connection attributes");
+                } catch (SQLException e) {
+                    // If we can't create a replacement connection, use the original
+                    Scope.getCurrentScope().getLog(getClass()).fine(
+                        "Could not add connection attributes to manually-created connection: " + e.getMessage());
+                }
+            }
+        }
         
-        if (originalUrl.contains("connectionAttributes=")) {
-            // Append to existing connectionAttributes
-            return originalUrl.replaceFirst(
-                "(connectionAttributes=[^&]*)",
-                "$1," + connectionAttributes
-            );
-        } else {
-            // Add new connectionAttributes parameter
-            return originalUrl + separator + "connectionAttributes=" + connectionAttributes;
-        }
-    }
-
-    private String getLiquibaseVersion() {
-        try {
-            ResourceBundle bundle = ResourceBundle.getBundle("liquibase/build");
-            return bundle.getString("build.version");
-        } catch (Exception e) {
-            return "unknown";
-        }
+        super.setConnection(connectionToUse);
     }
 
     @Override
